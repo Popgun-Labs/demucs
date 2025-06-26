@@ -33,18 +33,18 @@ from demucs.pretrained import SOURCES
 from demucs.wav import build_metadata, Wavset, _get_musdb_valid
 
 
-MUSDB_PATH = '/checkpoint/defossez/datasets/musdbhq'
-EXTRA_WAV_PATH = "/checkpoint/defossez/datasets/allstems_44"
+MUSDB_PATH = '/Volumes/SAMPLES/datasets/musdb18hq'
+EXTRA_WAV_PATH = '/Volumes/SAMPLES/datasets/stem_separation_tests'
 # WARNING: OUTPATH will be completely erased.
-OUTPATH = Path.home() / 'tmp/demucs_mdx/automix_musdb/'
-CACHE = Path.home() / 'tmp/automix_cache'  # cache BPM and pitch information.
+OUTPATH = Path.home() / '/Volumes/SAMPLES/datasets/stem_separation_tests_automix'
+CACHE = Path.home() / '/Volumes/SAMPLES/datasets/tmp/automix_cache'  # cache BPM and pitch information.
 CHANNELS = 2
 SR = 44100
 MAX_PITCH = 3  # maximum allowable pitch shift in semi tones
 MAX_TEMPO = 0.15  # maximum allowable tempo shift
 
 
-Spec = namedtuple("Spec", "tempo onsets kr track index")
+Spec = namedtuple("Spec", "tempo onsets kr_bass kr_chordal kr_lead track index")
 
 
 def rms(wav, window=10000):
@@ -73,30 +73,81 @@ def analyse_track(dset, index):
     if cache_file.exists():
         cached = try_load(cache_file)
         if cached is not None:
-            tempo, events, hist_kr = cached
+            if len(cached) == 3:
+                # Old format with single kr
+                tempo, events, old_kr = cached
+                kr_bass = old_kr  # Use old kr as bass for backward compatibility
+                kr_chordal = kr_lead = None
+            else:
+                # New format with separate kr values
+                tempo, events, kr_bass, kr_chordal, kr_lead = cached
 
     if cached is None:
-        drums = track[0].mean(0)
+        # Find drums track (should be first in SOURCES list)
+        drums_idx = SOURCES.index("drums") if "drums" in SOURCES else 0
+        drums = track[drums_idx].mean(0)
         if drums.std() > 1e-2 * ref:
             tempo, events = beat_track(y=drums.numpy(), units='time', sr=SR)
         else:
             print("failed drums", drums.std(), ref)
             return None, track
 
-        bass = track[1].mean(0)
-        r = rms(bass)
-        peak = r.max()
-        mask = r >= 0.05 * peak
-        bass = bass[mask]
-        if bass.std() > 1e-2 * ref:
-            kr = torch.from_numpy(chroma_cqt(y=bass.numpy(), sr=SR))
-            hist_kr = (kr.max(dim=0, keepdim=True)[0] == kr).float().mean(1)
-        else:
-            print("failed bass", bass.std(), ref)
-            return None, track
+        # Analyze pitch-related tracks separately: bass, chordal, and lead
+        kr_bass = kr_chordal = kr_lead = None
+        
+        # Analyze bass
+        if "bass" in SOURCES:
+            bass_idx = SOURCES.index("bass")
+            bass = track[bass_idx].mean(0)
+            r = rms(bass)
+            peak = r.max()
+            mask = r >= 0.05 * peak
+            bass = bass[mask]
+            if bass.std() > 1e-2 * ref:
+                kr = torch.from_numpy(chroma_cqt(y=bass.numpy(), sr=SR))
+                kr_bass = (kr.max(dim=0, keepdim=True)[0] == kr).float().mean(1)
+        
+        # Analyze chordal
+        if "chordal" in SOURCES:
+            chordal_idx = SOURCES.index("chordal")
+            chordal = track[chordal_idx].mean(0)
+            r = rms(chordal)
+            peak = r.max()
+            mask = r >= 0.05 * peak
+            chordal = chordal[mask]
+            if chordal.std() > 1e-2 * ref:
+                kr = torch.from_numpy(chroma_cqt(y=chordal.numpy(), sr=SR))
+                kr_chordal = (kr.max(dim=0, keepdim=True)[0] == kr).float().mean(1)
+        
+        # Analyze lead
+        if "lead" in SOURCES:
+            lead_idx = SOURCES.index("lead")
+            lead = track[lead_idx].mean(0)
+            r = rms(lead)
+            peak = r.max()
+            mask = r >= 0.05 * peak
+            lead = lead[mask]
+            if lead.std() > 1e-2 * ref:
+                kr = torch.from_numpy(chroma_cqt(y=lead.numpy(), sr=SR))
+                kr_lead = (kr.max(dim=0, keepdim=True)[0] == kr).float().mean(1)
+        
+        # Fallback to bass if no stems were analyzable
+        if kr_bass is None and kr_chordal is None and kr_lead is None:
+            bass_idx = SOURCES.index("bass") if "bass" in SOURCES else 1
+            bass = track[bass_idx].mean(0)
+            r = rms(bass)
+            peak = r.max()
+            mask = r >= 0.05 * peak
+            bass = bass[mask]
+            if bass.std() > 1e-2 * ref:
+                kr = torch.from_numpy(chroma_cqt(y=bass.numpy(), sr=SR))
+                kr_bass = (kr.max(dim=0, keepdim=True)[0] == kr).float().mean(1)
+            else:
+                print("failed pitch analysis on all stems")
+                return None, track
 
-    pickle.dump([tempo, events, hist_kr], open(cache_file, 'wb'))
-    spec = Spec(tempo, events, hist_kr, track, index)
+    pickle.dump([tempo, events, kr_bass, kr_chordal, kr_lead], open(cache_file, 'wb'))
+    spec = Spec(tempo, events, kr_bass, kr_chordal, kr_lead, track, index)
     return spec, None
 
 
@@ -194,10 +245,27 @@ def find_candidate(spec_ref, catalog, pitch_match=True):
 
         ps = 0
         if pitch_match:
-            ps = best_pitch_shift(spec_ref.kr, spec.kr)
-            if abs(ps) > MAX_PITCH:
-                print("Failed pitch", ps)
-                # too much pitch difference
+            # Try to find the best pitch match using any available chromagram
+            pitch_matches = []
+            if spec_ref.kr_bass is not None and spec.kr_bass is not None:
+                ps_bass = best_pitch_shift(spec_ref.kr_bass, spec.kr_bass)
+                pitch_matches.append(ps_bass)
+            if spec_ref.kr_chordal is not None and spec.kr_chordal is not None:
+                ps_chordal = best_pitch_shift(spec_ref.kr_chordal, spec.kr_chordal)
+                pitch_matches.append(ps_chordal)
+            if spec_ref.kr_lead is not None and spec.kr_lead is not None:
+                ps_lead = best_pitch_shift(spec_ref.kr_lead, spec.kr_lead)
+                pitch_matches.append(ps_lead)
+            
+            if pitch_matches:
+                # Use the average pitch shift or the most common one
+                ps = int(np.mean(pitch_matches))
+                if abs(ps) > MAX_PITCH:
+                    print("Failed pitch", ps, pitch_matches)
+                    # too much pitch difference
+                    continue
+            else:
+                print("No pitch data available for matching")
                 continue
         return spec, delta_tempo, ps
 
@@ -206,7 +274,9 @@ def get_part(spec, source, dt, dp):
     """Apply given delta of tempo and delta of pitch to a stem."""
     wav = spec.track[source]
     if dt or dp:
-        wav = repitch(wav, dp, dt * 100, samplerate=SR, voice=source == 3)
+        # Check if this source is vocals (use voice processing only for vocals)
+        vocals_idx = SOURCES.index("vocals") if "vocals" in SOURCES else 3
+        wav = repitch(wav, dp, dt * 100, samplerate=SR, voice=source == vocals_idx)
         spec = spec._replace(onsets=spec.onsets / (1 + dt))
     return wav, spec
 
@@ -238,7 +308,7 @@ def build_track(ref_index, catalog):
     for src in order[1:]:
         spec, dt, dp = find_candidate(spec_ref, catalog, pitch_match=pitch_match)
         if not pitch_match:
-            spec_ref = spec_ref._replace(kr=spec.kr)
+            spec_ref = spec_ref._replace(kr_bass=spec.kr_bass, kr_chordal=spec.kr_chordal, kr_lead=spec.kr_lead)
         pitch_match = True
         dps[src] = dp
         dts[src] = dt
@@ -268,7 +338,7 @@ def get_musdb_dataset(part='train'):
 def get_wav_dataset():
     root = Path(EXTRA_WAV_PATH)
     ext = '.wav'
-    metadata = _build_metadata(root, SOURCES, ext=ext, normalize=False)
+    metadata = build_metadata(root, SOURCES, ext=ext, normalize=False)
     train_set = Wavset(
         root, metadata, SOURCES, samplerate=SR, channels=CHANNELS,
         normalize=False, ext=ext)
@@ -286,8 +356,8 @@ def main():
     (OUTPATH / 'valid').mkdir(exist_ok=True, parents=True)
     out = OUTPATH / 'train'
 
-    dset = get_musdb_dataset()
-    # dset2 = get_wav_dataset()
+    # dset = get_musdb_dataset()
+    dset = get_wav_dataset()
     # dset3 = get_musdb_dataset('test')
     dset2 = None
     dset3 = None

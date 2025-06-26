@@ -40,8 +40,9 @@ def explorer(launcher: Launcher):
             sub = get_sub(launcher, sig)
             sub.bind_(ft)
             for segment in [15, 18]:
-                for source in range(4):
-                    w = [0] * 4
+                from demucs.pretrained import SOURCES
+                for source in range(len(SOURCES)):
+                    w = [0] * len(SOURCES)
                     w[source] = 1
                     sub({'weights': w, 'dset.segment': segment})
 
@@ -49,7 +50,7 @@ def explorer(launcher: Launcher):
             sub = get_sub(launcher, sig)
             sub.bind_(ft)
             for segment in [10, 15]:
-                for source in range(4):
-                    w = [0] * 4
+                for source in range(len(SOURCES)):
+                    w = [0] * len(SOURCES)
                     w[source] = 1
                     sub({'weights': w, 'dset.segment': segment})

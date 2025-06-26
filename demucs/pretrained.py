@@ -20,12 +20,12 @@ logger = logging.getLogger(__name__)
 ROOT_URL = "https://dl.fbaipublicfiles.com/demucs/"
 REMOTE_ROOT = Path(__file__).parent / 'remote'
 
-SOURCES = ["drums", "bass", "other", "vocals"]
+SOURCES = ["drums", "bass", "other", "vocals", "chordal", "lead"]
 DEFAULT_MODEL = 'htdemucs'
 
 
 def demucs_unittest():
-    model = HDemucs(channels=4, sources=SOURCES)
+    model = HDemucs(channels=len(SOURCES), sources=SOURCES)
     return model
 
 
