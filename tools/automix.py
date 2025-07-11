@@ -34,9 +34,9 @@ from demucs.wav import build_metadata, Wavset, _get_musdb_valid
 
 
 MUSDB_PATH = '/Volumes/SAMPLES/datasets/musdb18hq'
-EXTRA_WAV_PATH = '/Volumes/SAMPLES/datasets/stem_separation_tests'
+EXTRA_WAV_PATH = '/Volumes/SAMPLES/datasets/stem_separation_50_songs_source'
 # WARNING: OUTPATH will be completely erased.
-OUTPATH = Path.home() / '/Volumes/SAMPLES/datasets/stem_separation_tests_automix'
+OUTPATH = Path.home() / '/Volumes/SAMPLES/datasets/stem_separation_50_songs_automix'
 CACHE = Path.home() / '/Volumes/SAMPLES/datasets/tmp/automix_cache'  # cache BPM and pitch information.
 CHANNELS = 2
 SR = 44100
