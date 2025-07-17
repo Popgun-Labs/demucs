@@ -11,20 +11,531 @@ import matplotlib.pyplot as plt
 from collections import defaultdict, Counter
 import torchaudio
 import torch
+from torch.nn import functional as F
 import traceback
 import tqdm
 import shutil
+import json
+
+# Add librosa imports for tempo/pitch analysis
+try:
+    from librosa.beat import beat_track
+    from librosa.feature import chroma_cqt
+    LIBROSA_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: librosa not available: {e}")
+    LIBROSA_AVAILABLE = False
 
 import sys
 sys.path.append('.')
 
 from demucs.pretrained import SOURCES
-from demucs.wav import build_metadata
+# from demucs.wav import build_metadata
+# from demucs.audio import save_audio
+# import hashlib
 
 # Import constants directly
 CACHE = Path.home() / '/Volumes/SAMPLES/datasets/tmp/automix_cache'
 MAX_TEMPO = 0.15
 MAX_PITCH = 3
+SR = 44100
+CHANNELS = 2
+
+
+def rms(wav, window=10000):
+    """efficient rms computed for each time step over a given window."""
+    half = window // 2
+    window = 2 * half + 1
+    wav = F.pad(wav, (half, half))
+    tot = wav.pow(2).cumsum(dim=-1)
+    return ((tot[..., window - 1:] - tot[..., :-window + 1]) / window).sqrt()
+
+
+def best_pitch_shift(kr_a, kr_b):
+    """find the best pitch shift between two chroma distributions."""
+    deltas = []
+    for p in range(12):
+        deltas.append((kr_a - kr_b).abs().mean())
+        kr_b = kr_b.roll(1, 0)
+
+    ps = np.argmin(deltas)
+    if ps > 6:
+        ps = ps - 12
+    return ps
+
+
+def analyse_track_tempo_pitch(track_data, track_name="Unknown"):
+    """Analyze track tempo and pitch information using EXACT automix.py methods."""
+    try:
+        if isinstance(track_data, dict):
+            # Convert dict to tensor if needed
+            track_tensor = torch.stack([track_data[source] for source in SOURCES])
+        else:
+            track_tensor = track_data
+            
+        # EXACT copy of automix.py logic
+        mix = track_tensor.sum(0).mean(0)
+        ref = mix.std()
+
+        starts = (abs(mix) >= 1e-2 * ref).float().argmax().item()
+        track_tensor = track_tensor[..., starts:]
+
+        # Find drums track (should be first in SOURCES list)
+        drums_idx = SOURCES.index("drums") if "drums" in SOURCES else 0
+        drums = track_tensor[drums_idx].mean(0)
+        
+        tempo = None
+        events = None
+        if drums.std() > 1e-2 * ref:
+            try:
+                tempo, events = beat_track(y=drums.numpy(), units='time', sr=SR)
+            except Exception as e:
+                print(f"failed drums tempo analysis for {track_name}: {e}")
+                return None
+
+        # Analyze pitch-related tracks separately: bass, chordal, and lead
+        kr_bass = kr_chordal = kr_lead = None
+        
+        # Analyze bass - EXACT copy from automix.py
+        if "bass" in SOURCES:
+            bass_idx = SOURCES.index("bass")
+            bass = track_tensor[bass_idx].mean(0)
+            r = rms(bass)
+            peak = r.max()
+            mask = r >= 0.05 * peak
+            bass = bass[mask]
+            if bass.std() > 1e-2 * ref:
+                try:
+                    kr = torch.from_numpy(chroma_cqt(y=bass.numpy(), sr=SR))
+                    kr_bass = (kr.max(dim=0, keepdim=True)[0] == kr).float().mean(1)
+                except Exception as e:
+                    print(f"Failed bass pitch analysis for {track_name}: {e}")
+        
+        # Analyze chordal - EXACT copy from automix.py  
+        if "chordal" in SOURCES:
+            chordal_idx = SOURCES.index("chordal")
+            chordal = track_tensor[chordal_idx].mean(0)
+            r = rms(chordal)
+            peak = r.max()
+            mask = r >= 0.05 * peak
+            chordal = chordal[mask]
+            if chordal.std() > 1e-2 * ref:
+                try:
+                    kr = torch.from_numpy(chroma_cqt(y=chordal.numpy(), sr=SR))
+                    kr_chordal = (kr.max(dim=0, keepdim=True)[0] == kr).float().mean(1)
+                except Exception as e:
+                    print(f"Failed chordal pitch analysis for {track_name}: {e}")
+        
+        # Analyze lead - EXACT copy from automix.py
+        if "lead" in SOURCES:
+            lead_idx = SOURCES.index("lead")
+            lead = track_tensor[lead_idx].mean(0)
+            r = rms(lead)
+            peak = r.max()
+            mask = r >= 0.05 * peak
+            lead = lead[mask]
+            if lead.std() > 1e-2 * ref:
+                try:
+                    kr = torch.from_numpy(chroma_cqt(y=lead.numpy(), sr=SR))
+                    kr_lead = (kr.max(dim=0, keepdim=True)[0] == kr).float().mean(1)
+                except Exception as e:
+                    print(f"Failed lead pitch analysis for {track_name}: {e}")
+        
+        # Fallback to bass if no stems were analyzable - EXACT copy from automix.py
+        if kr_bass is None and kr_chordal is None and kr_lead is None:
+            bass_idx = SOURCES.index("bass") if "bass" in SOURCES else 1
+            bass = track_tensor[bass_idx].mean(0)
+            r = rms(bass)
+            peak = r.max()
+            mask = r >= 0.05 * peak
+            bass = bass[mask]
+            if bass.std() > 1e-2 * ref:
+                try:
+                    kr = torch.from_numpy(chroma_cqt(y=bass.numpy(), sr=SR))
+                    kr_bass = (kr.max(dim=0, keepdim=True)[0] == kr).float().mean(1)
+                except Exception as e:
+                    print(f"Failed fallback bass pitch analysis for {track_name}: {e}")
+            else:
+                print(f"failed pitch analysis on all stems for {track_name}")
+                return None
+
+        return {
+            'tempo': tempo,
+            'events': events,
+            'kr_bass': kr_bass,
+            'kr_chordal': kr_chordal,
+            'kr_lead': kr_lead
+        }
+    except Exception as e:
+        print(f"Failed to analyze {track_name}: {e}")
+        return None
+
+
+def load_track_data(track_path, sources=None):
+    """Load track data from directory."""
+    if sources is None:
+        sources = SOURCES
+    
+    track_data = {}
+    for source in sources:
+        stem_path = track_path / f"{source}.wav"
+        if stem_path.exists():
+            try:
+                audio, sr = torchaudio.load(str(stem_path))
+                if sr != SR:
+                    audio = torchaudio.functional.resample(audio, sr, SR)
+                track_data[source] = audio
+            except Exception as e:
+                print(f"Failed to load {stem_path}: {e}")
+                return None
+        else:
+            print(f"Missing stem: {stem_path}")
+            return None
+    
+    return track_data
+
+
+def check_tempo_pitch_compatibility(dataset_path, sources=None):
+    """Comprehensive tempo and pitch compatibility analysis."""
+    if not LIBROSA_AVAILABLE:
+        print("❌ Cannot perform tempo/pitch analysis: librosa not available")
+        print("This is likely due to scipy compatibility issues.")
+        print("Try updating librosa and scipy, or running automix.py directly to see the same errors.")
+        return
+    
+    if sources is None:
+        sources = SOURCES
+    
+    dataset_path = Path(dataset_path)
+    
+    print(f"🎵 Tempo and Pitch Compatibility Analysis")
+    print(f"Dataset: {dataset_path}")
+    print(f"Current constraints: MAX_TEMPO={MAX_TEMPO:.1%}, MAX_PITCH={MAX_PITCH} semitones")
+    print("=" * 60)
+    
+    # Find all tracks
+    track_dirs = []
+    for item in dataset_path.iterdir():
+        if item.is_dir():
+            # Check if it has all required stems
+            has_all_stems = all((item / f"{source}.wav").exists() for source in sources)
+            if has_all_stems:
+                track_dirs.append(item)
+    
+    if not track_dirs:
+        print("❌ No complete tracks found!")
+        return
+    
+    print(f"📁 Found {len(track_dirs)} complete tracks")
+    
+    # Analyze all tracks
+    track_analyses = {}
+    successful_analyses = 0
+    failed_analyses = 0
+    
+    print("\n🔍 Analyzing tracks...")
+    for track_dir in tqdm.tqdm(track_dirs, desc="Analyzing tracks"):
+        track_name = track_dir.name
+        
+        # Load track data
+        track_data = load_track_data(track_dir, sources)
+        if track_data is None:
+            failed_analyses += 1
+            continue
+        
+        # Analyze tempo and pitch
+        analysis = analyse_track_tempo_pitch(track_data, track_name)
+        if analysis is None or analysis['tempo'] is None:
+            failed_analyses += 1
+            continue
+        
+        track_analyses[track_name] = analysis
+        successful_analyses += 1
+    
+    print(f"\n📊 Analysis Results:")
+    print(f"Successfully analyzed: {successful_analyses}")
+    print(f"Failed to analyze: {failed_analyses}")
+    
+    if not track_analyses:
+        print("❌ No tracks could be analyzed!")
+        return
+    
+    # Save tempo data to JSON file for inspection
+    tempo_data = {}
+    pitch_data = {}
+    
+    for track_name, analysis in track_analyses.items():
+        tempo_data[track_name] = {
+            "tempo_bpm": float(analysis['tempo']) if analysis['tempo'] is not None else None,
+            "has_kr_bass": analysis['kr_bass'] is not None,
+            "has_kr_chordal": analysis['kr_chordal'] is not None,
+            "has_kr_lead": analysis['kr_lead'] is not None,
+        }
+        
+        # Add pitch fingerprint info if available
+        pitch_info = {}
+        if analysis['kr_bass'] is not None:
+            pitch_info['bass_fingerprint'] = analysis['kr_bass'].tolist()
+        if analysis['kr_chordal'] is not None:
+            pitch_info['chordal_fingerprint'] = analysis['kr_chordal'].tolist()
+        if analysis['kr_lead'] is not None:
+            pitch_info['lead_fingerprint'] = analysis['kr_lead'].tolist()
+        
+        pitch_data[track_name] = pitch_info
+    
+    # Save to JSON files
+    output_dir = dataset_path / "tempo_analysis"
+    output_dir.mkdir(exist_ok=True)
+    
+    tempo_file = output_dir / "tempo_data.json"
+    pitch_file = output_dir / "pitch_data.json"
+    
+    with open(tempo_file, 'w') as f:
+        json.dump(tempo_data, f, indent=2, sort_keys=True)
+    
+    with open(pitch_file, 'w') as f:
+        json.dump(pitch_data, f, indent=2, sort_keys=True)
+    
+    print(f"💾 Saved tempo data to: {tempo_file}")
+    print(f"💾 Saved pitch data to: {pitch_file}")
+    
+    # Tempo distribution analysis
+    tempos = [analysis['tempo'] for analysis in track_analyses.values()]
+    tempos = np.array(tempos)
+    
+    print(f"\n🎵 Tempo Distribution:")
+    print(f"Mean tempo: {tempos.mean():.1f} BPM")
+    print(f"Range: {tempos.min():.1f} - {tempos.max():.1f} BPM")
+    print(f"Std: {tempos.std():.1f} BPM")
+    
+    # Tempo compatibility analysis - EXACT automix.py logic
+    print(f"\n🔄 Tempo Compatibility Analysis:")
+    total_pairs = 0
+    compatible_pairs = 0
+    tempo_failures = []
+    
+    track_names = list(track_analyses.keys())
+    for i, track1 in enumerate(track_names):
+        for j, track2 in enumerate(track_names):
+            if i >= j:
+                continue
+            
+            total_pairs += 1
+            tempo1 = track_analyses[track1]['tempo']
+            tempo2 = track_analyses[track2]['tempo']
+            
+            # EXACT automix.py tempo compatibility logic
+            ok = False
+            best_delta = float('inf')
+            for scale in [1/4, 1/2, 1, 2, 4]:
+                tempo = tempo2 * scale
+                delta_tempo = tempo1 / tempo - 1
+                if abs(delta_tempo) < abs(best_delta):
+                    best_delta = delta_tempo
+                if abs(delta_tempo) < MAX_TEMPO:
+                    ok = True
+                    break
+            
+            if ok:
+                compatible_pairs += 1
+            else:
+                tempo_failures.append((track1, track2, best_delta))
+    
+    tempo_compat_rate = compatible_pairs / total_pairs if total_pairs > 0 else 0
+    print(f"Tempo compatibility rate: {tempo_compat_rate:.1%} ({compatible_pairs}/{total_pairs} pairs)")
+    
+    # Pitch compatibility analysis - EXACT automix.py logic
+    print(f"\n🎼 Pitch Compatibility Analysis:")
+    pitch_compatible_pairs = 0
+    pitch_failures = []
+    no_pitch_data_pairs = 0
+    
+    for i, track1 in enumerate(track_names):
+        for j, track2 in enumerate(track_names):
+            if i >= j:
+                continue
+            
+            analysis1 = track_analyses[track1]
+            analysis2 = track_analyses[track2]
+            
+            # EXACT automix.py pitch matching logic
+            pitch_matches = []
+            if analysis1['kr_bass'] is not None and analysis2['kr_bass'] is not None:
+                ps_bass = best_pitch_shift(analysis1['kr_bass'], analysis2['kr_bass'])
+                pitch_matches.append(ps_bass)
+            if analysis1['kr_chordal'] is not None and analysis2['kr_chordal'] is not None:
+                ps_chordal = best_pitch_shift(analysis1['kr_chordal'], analysis2['kr_chordal'])
+                pitch_matches.append(ps_chordal)
+            if analysis1['kr_lead'] is not None and analysis2['kr_lead'] is not None:
+                ps_lead = best_pitch_shift(analysis1['kr_lead'], analysis2['kr_lead'])
+                pitch_matches.append(ps_lead)
+            
+            if pitch_matches:
+                # Use the average pitch shift or the most common one
+                ps = int(np.mean(pitch_matches))
+                if abs(ps) <= MAX_PITCH:
+                    pitch_compatible_pairs += 1
+                else:
+                    pitch_failures.append((track1, track2, ps))
+            else:
+                no_pitch_data_pairs += 1
+                # In automix.py, this would be a failure ("No pitch data available for matching")
+    
+    pitch_compat_rate = pitch_compatible_pairs / total_pairs if total_pairs > 0 else 0
+    print(f"Pitch compatibility rate: {pitch_compat_rate:.1%} ({pitch_compatible_pairs}/{total_pairs} pairs)")
+    if no_pitch_data_pairs > 0:
+        print(f"No pitch data available for: {no_pitch_data_pairs} pairs")
+    
+    # Combined compatibility - tracks must pass BOTH tempo and pitch checks
+    combined_compatible = 0
+    combined_failures = []
+    
+    for i, track1 in enumerate(track_names):
+        for j, track2 in enumerate(track_names):
+            if i >= j:
+                continue
+            
+            tempo1 = track_analyses[track1]['tempo']
+            tempo2 = track_analyses[track2]['tempo']
+            analysis1 = track_analyses[track1]
+            analysis2 = track_analyses[track2]
+            
+            # Check tempo first
+            tempo_ok = False
+            tempo_delta = float('inf')
+            for scale in [1/4, 1/2, 1, 2, 4]:
+                tempo = tempo2 * scale
+                delta_tempo = tempo1 / tempo - 1
+                if abs(delta_tempo) < abs(tempo_delta):
+                    tempo_delta = delta_tempo
+                if abs(delta_tempo) < MAX_TEMPO:
+                    tempo_ok = True
+                    break
+            
+            if not tempo_ok:
+                combined_failures.append((track1, track2, f"TEMPO_FAILED: {float(tempo_delta):.1%}"))
+                continue
+            
+            # Check pitch
+            pitch_matches = []
+            if analysis1['kr_bass'] is not None and analysis2['kr_bass'] is not None:
+                ps_bass = best_pitch_shift(analysis1['kr_bass'], analysis2['kr_bass'])
+                pitch_matches.append(ps_bass)
+            if analysis1['kr_chordal'] is not None and analysis2['kr_chordal'] is not None:
+                ps_chordal = best_pitch_shift(analysis1['kr_chordal'], analysis2['kr_chordal'])
+                pitch_matches.append(ps_chordal)
+            if analysis1['kr_lead'] is not None and analysis2['kr_lead'] is not None:
+                ps_lead = best_pitch_shift(analysis1['kr_lead'], analysis2['kr_lead'])
+                pitch_matches.append(ps_lead)
+            
+            if pitch_matches:
+                ps = int(np.mean(pitch_matches))
+                if abs(ps) <= MAX_PITCH:
+                    combined_compatible += 1
+                else:
+                    combined_failures.append((track1, track2, f"PITCH_FAILED: {ps} semitones"))
+            else:
+                combined_failures.append((track1, track2, "NO_PITCH_DATA"))
+    
+    combined_rate = combined_compatible / total_pairs if total_pairs > 0 else 0
+    print(f"Combined compatibility rate: {combined_rate:.1%} ({combined_compatible}/{total_pairs} pairs)")
+    print(f"This represents tracks that would successfully mix in automix.py")
+    
+    # Suggest better constraints
+    print(f"\n💡 Constraint Suggestions:")
+    if tempo_failures:
+        tempo_deltas = [abs(delta) for _, _, delta in tempo_failures]
+        suggested_tempo = np.percentile(tempo_deltas, 80)  # 80th percentile
+        print(f"Current MAX_TEMPO: {float(MAX_TEMPO):.1%}")
+        print(f"Suggested MAX_TEMPO: {float(suggested_tempo):.1%} (would allow {80}% of failed pairs)")
+    
+    if pitch_failures:
+        pitch_deltas = [abs(ps) for _, _, ps in pitch_failures]
+        suggested_pitch = int(np.percentile(pitch_deltas, 80))  # 80th percentile
+        print(f"Current MAX_PITCH: {MAX_PITCH} semitones")
+        print(f"Suggested MAX_PITCH: {suggested_pitch} semitones (would allow {80}% of failed pairs)")
+    
+    # Show worst incompatibilities
+    if tempo_failures:
+        print(f"\n🚫 Worst Tempo Incompatibilities:")
+        worst_tempo = sorted(tempo_failures, key=lambda x: abs(x[2]), reverse=True)[:5]
+        for track1, track2, delta in worst_tempo:
+            print(f"  {track1} vs {track2}: {float(delta):.1%} tempo difference")
+    
+    if pitch_failures:
+        print(f"\n🚫 Worst Pitch Incompatibilities:")
+        worst_pitch = sorted(pitch_failures, key=lambda x: abs(x[2]), reverse=True)[:5]
+        for track1, track2, ps in worst_pitch:
+            print(f"  {track1} vs {track2}: {ps:.0f} semitone difference")
+    
+    # Show combined failures breakdown
+    if combined_failures:
+        print(f"\n📊 Combined Failure Breakdown:")
+        failure_types = {}
+        for _, _, reason in combined_failures:
+            failure_type = reason.split(':')[0]
+            failure_types[failure_type] = failure_types.get(failure_type, 0) + 1
+        
+        for failure_type, count in sorted(failure_types.items(), key=lambda x: x[1], reverse=True):
+            print(f"  {failure_type}: {count} pairs ({count/total_pairs:.1%})")
+        
+        print(f"\n🚫 Example Combined Failures:")
+        for i, (track1, track2, reason) in enumerate(combined_failures[:5]):
+            print(f"  {track1} vs {track2}: {reason}")
+    
+    # Save comprehensive analysis to JSON
+    analysis_summary = {
+        "dataset_info": {
+            "path": str(dataset_path),
+            "total_tracks": len(track_analyses),
+            "successful_analyses": successful_analyses,
+            "failed_analyses": failed_analyses
+        },
+        "tempo_stats": {
+            "mean_bpm": float(tempos.mean()),
+            "min_bpm": float(tempos.min()),
+            "max_bpm": float(tempos.max()),
+            "std_bpm": float(tempos.std())
+        },
+        "current_constraints": {
+            "max_tempo_percent": float(MAX_TEMPO) * 100,
+            "max_pitch_semitones": int(MAX_PITCH)
+        },
+        "compatibility_rates": {
+            "tempo_percent": tempo_compat_rate * 100,
+            "pitch_percent": pitch_compat_rate * 100,
+            "combined_percent": combined_rate * 100
+        },
+        "suggestions": {},
+        "failure_breakdown": {}
+    }
+    
+    # Add suggestions if available
+    if tempo_failures:
+        tempo_deltas = [abs(delta) for _, _, delta in tempo_failures]
+        suggested_tempo = np.percentile(tempo_deltas, 80)
+        analysis_summary["suggestions"]["suggested_max_tempo_percent"] = float(suggested_tempo) * 100
+    
+    if pitch_failures:
+        pitch_deltas = [abs(ps) for _, _, ps in pitch_failures]
+        suggested_pitch = int(np.percentile(pitch_deltas, 80))
+        analysis_summary["suggestions"]["suggested_max_pitch_semitones"] = suggested_pitch
+    
+    # Add failure breakdown
+    if combined_failures:
+        failure_types = {}
+        for _, _, reason in combined_failures:
+            failure_type = reason.split(':')[0]
+            failure_types[failure_type] = failure_types.get(failure_type, 0) + 1
+        analysis_summary["failure_breakdown"] = failure_types
+    
+    # Save analysis summary
+    summary_file = output_dir / "analysis_summary.json"
+    with open(summary_file, 'w') as f:
+        json.dump(analysis_summary, f, indent=2)
+    
+    print(f"💾 Saved analysis summary to: {summary_file}")
+    print(f"\n📁 All analysis files saved to: {output_dir}")
 
 
 def validate_audio_file(file_path, expected_sr=44100, expected_channels=2):
@@ -223,7 +734,7 @@ def analyze_dataset_compatibility(dataset_path):
     # Check for build_metadata compatibility
     try:
         print("Testing build_metadata compatibility...")
-        from demucs.wav import build_metadata
+        # from demucs.wav import build_metadata
         
         # Try to build metadata for a subset
         sample_dirs = track_dirs[:5]  # Test first 5 tracks
@@ -1072,18 +1583,307 @@ def repair_sample_counts(dataset_path, sources=None, strategy='auto_majority', b
     return tracks_repaired > 0
 
 
+def check_audio_content_percentages(dataset_path, sources=None, threshold=30, sensitivity=0.01):
+    """Check percentage of significant audio content in each stem."""
+    if sources is None:
+        sources = SOURCES
+    
+    print(f"🔍 Checking audio content percentages in: {dataset_path}")
+    print(f"Threshold: {threshold}% significant audio")
+    print(f"Sensitivity: {sensitivity*100:.1f}% of peak RMS")
+    print(f"Window size: 50ms (DC-removed)")
+    print(f"Sources: {sources}")
+    print(f"=" * 60)
+    
+    root = Path(dataset_path)
+    if not root.exists():
+        print(f"❌ Dataset path does not exist: {dataset_path}")
+        return False
+    
+    # Find all track directories
+    track_dirs = [d for d in root.iterdir() if d.is_dir()]
+    if not track_dirs:
+        print(f"❌ No track directories found")
+        return False
+    
+    print(f"📁 Analyzing {len(track_dirs)} tracks for audio content...")
+    
+    # Results tracking
+    track_results = {}
+    problematic_stems = []
+    total_stems_analyzed = 0
+    stems_below_threshold = 0
+    
+    def analyze_stem_content(stem_file):
+        """Analyze audio content percentage in a single stem file."""
+        try:
+            # Load the entire file
+            waveform, sr = torchaudio.load(str(stem_file))
+            total_samples = waveform.shape[-1]
+            
+            if total_samples == 0:
+                return 0.0, "Empty file", {}
+            
+            # Remove DC offset first
+            waveform_dc_removed = waveform - torch.mean(waveform, dim=-1, keepdim=True)
+            
+            # Calculate overall RMS to set adaptive threshold (using DC-removed signal)
+            overall_rms = torch.sqrt(torch.mean(waveform_dc_removed**2))
+            peak_rms = torch.sqrt(torch.mean(waveform_dc_removed**2, dim=0).max())
+            
+            # Use adaptive threshold: user-defined % of peak RMS, but at least 1e-4
+            adaptive_threshold = max(peak_rms * sensitivity, 1e-4)
+            
+            # Calculate RMS in chunks to find non-silent portions
+            chunk_size = sr // 20  # 0.05 second (50ms) chunks
+            non_silent_chunks = 0
+            total_chunks = 0
+            chunk_rms_values = []
+            
+            # Process in chunks
+            for i in range(0, total_samples, chunk_size):
+                chunk = waveform_dc_removed[..., i:i+chunk_size]
+                if chunk.shape[-1] > 0:  # Valid chunk
+                    chunk_rms = torch.sqrt(torch.mean(chunk**2))
+                    chunk_rms_values.append(float(chunk_rms))
+                    if chunk_rms > adaptive_threshold:
+                        non_silent_chunks += 1
+                    total_chunks += 1
+            
+            if total_chunks > 0:
+                percentage = (non_silent_chunks / total_chunks) * 100
+                
+                # Return debug info
+                debug_info = {
+                    'overall_rms': float(overall_rms),
+                    'peak_rms': float(peak_rms),
+                    'adaptive_threshold': float(adaptive_threshold),
+                    'total_chunks': total_chunks,
+                    'non_silent_chunks': non_silent_chunks,
+                    'chunk_rms_mean': float(np.mean(chunk_rms_values)) if chunk_rms_values else 0,
+                    'chunk_rms_max': float(np.max(chunk_rms_values)) if chunk_rms_values else 0
+                }
+                
+                return percentage, None, debug_info
+            else:
+                return 0.0, "No valid chunks", {}
+                
+        except Exception as e:
+            return 0.0, f"Error: {str(e)}", {}
+    
+    with tqdm.tqdm(track_dirs, desc="Analyzing audio content", unit="track") as pbar:
+        for track_dir in pbar:
+            pbar.set_postfix(track=track_dir.name[:20])
+            
+            track_results[track_dir.name] = {}
+            
+            # Analyze each stem
+            for source in sources:
+                stem_file = track_dir / f"{source}.wav"
+                
+                if not stem_file.exists():
+                    track_results[track_dir.name][source] = {
+                        'percentage': 0.0,
+                        'status': 'missing',
+                        'error': 'File not found'
+                    }
+                    continue
+                
+                total_stems_analyzed += 1
+                percentage, error, debug_info = analyze_stem_content(stem_file)
+                
+                track_results[track_dir.name][source] = {
+                    'percentage': percentage,
+                    'status': 'ok' if error is None else 'error',
+                    'error': error,
+                    'debug': debug_info
+                }
+                
+                # Check if below threshold
+                if error is None and percentage < threshold:
+                    stems_below_threshold += 1
+                    problematic_stems.append({
+                        'track': track_dir.name,
+                        'source': source,
+                        'percentage': percentage
+                    })
+    
+    # Generate report
+    print(f"\n📊 Audio Content Analysis Results:")
+    print(f"{'='*60}")
+    print(f"Total tracks analyzed: {len(track_dirs)}")
+    print(f"Total stems analyzed: {total_stems_analyzed}")
+    print(f"Stems below {threshold}% threshold: {stems_below_threshold}")
+    print(f"Problem rate: {stems_below_threshold/total_stems_analyzed*100:.1f}%")
+    
+    if problematic_stems:
+        print(f"\n🚫 Stems with < {threshold}% significant audio:")
+        print(f"{'='*60}")
+        
+        # Group by track
+        tracks_with_problems = {}
+        for stem in problematic_stems:
+            track = stem['track']
+            if track not in tracks_with_problems:
+                tracks_with_problems[track] = []
+            tracks_with_problems[track].append(stem)
+        
+        # Sort tracks by number of problematic stems (worst first)
+        sorted_tracks = sorted(tracks_with_problems.items(), 
+                             key=lambda x: len(x[1]), reverse=True)
+        
+        for track_name, stems in sorted_tracks:
+            print(f"\n📁 {track_name}:")
+            for stem in sorted(stems, key=lambda x: x['percentage']):
+                print(f"   {stem['source']}: {stem['percentage']:.1f}% significant audio")
+        
+    
+    else:
+        print(f"\n✅ All stems have sufficient audio content (≥{threshold}%)!")
+    
+    # Create visualization grouped by source type
+    source_data = {}
+    for track_name, track_results_dict in track_results.items():
+        for source, source_result in track_results_dict.items():
+            if source_result['status'] == 'ok':
+                if source not in source_data:
+                    source_data[source] = []
+                source_data[source].append(source_result['percentage'])
+    
+    if source_data:
+        print(f"\n📊 Creating distribution plots for each source type...")
+        
+        # Create separate plots for each source type
+        available_sources = [source for source in sources if source in source_data]
+        
+        # Calculate subplot layout
+        n_sources = len(available_sources)
+        cols = min(3, n_sources)  # Max 3 columns
+        rows = (n_sources + cols - 1) // cols  # Ceiling division
+        
+        fig, axes = plt.subplots(rows, cols, figsize=(5*cols, 4*rows))
+        
+        # Handle single subplot case
+        if n_sources == 1:
+            axes = [axes]
+        elif rows == 1:
+            axes = axes if n_sources > 1 else [axes]
+        else:
+            axes = axes.flatten()
+        
+        # Create histogram for each source
+        for i, source in enumerate(available_sources):
+            ax = axes[i]
+            values = np.array(source_data[source])
+            
+            # Create histogram
+            n_bins = min(20, len(values))  # Adjust bins based on data size
+            counts, bins, patches = ax.hist(values, bins=n_bins, alpha=0.7, color='skyblue', 
+                                          edgecolor='black', density=False)
+            
+            # Color bars below threshold in red
+            for j, (patch, bin_left, bin_right) in enumerate(zip(patches, bins[:-1], bins[1:])):
+                if bin_right <= threshold:
+                    patch.set_facecolor('red')
+                elif bin_left < threshold < bin_right:
+                    patch.set_facecolor('orange')  # Bins that cross threshold
+            
+            # Add threshold line
+            ax.axvline(x=threshold, color='red', linestyle='--', linewidth=2, 
+                      label=f'Threshold ({threshold}%)')
+            
+            # Add statistics lines
+            median_val = np.median(values)
+            mean_val = np.mean(values)
+            ax.axvline(x=median_val, color='green', linestyle='-', linewidth=2, 
+                      label=f'Median ({median_val:.1f}%)')
+            ax.axvline(x=mean_val, color='purple', linestyle=':', linewidth=2, 
+                      label=f'Mean ({mean_val:.1f}%)')
+            
+            # Customize subplot
+            ax.set_xlabel('Audio Content Percentage (%)')
+            ax.set_ylabel('Number of Stems')
+            ax.set_title(f'{source.capitalize()} Distribution (n={len(values)})')
+            ax.legend(fontsize=8)
+            ax.grid(True, alpha=0.3)
+            ax.set_xlim(0, 100)
+            
+            # Add statistics text
+            below_threshold = (values < threshold).sum()
+            at_100_percent = (values >= 99.9).sum()
+            stats_text = f'Below threshold: {below_threshold}\nAt 100%: {at_100_percent}\nStd: {values.std():.1f}%'
+            ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=8, 
+                   verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+        
+        # Hide unused subplots
+        for i in range(n_sources, len(axes)):
+            axes[i].set_visible(False)
+        
+        plt.tight_layout()
+        
+        # Save individual distribution plots
+        output_dir = root / "audio_content_analysis"
+        output_dir.mkdir(exist_ok=True)
+        
+        plot_file = output_dir / "audio_content_distributions.png"
+        plt.savefig(plot_file, dpi=300, bbox_inches='tight')
+        print(f"📈 Distribution plots saved to: {plot_file}")
+        
+        # Show statistics by source type
+        print(f"\n📊 Statistics by Source Type:")
+        for source in available_sources:
+            values = np.array(source_data[source])
+            below_threshold = (values < threshold).sum()
+            at_100_percent = (values >= 99.9).sum()
+            print(f"   {source}: {len(values)} stems, min={values.min():.1f}%, med={np.median(values):.1f}%, max={values.max():.1f}%, std={values.std():.1f}%, {below_threshold} below threshold, {at_100_percent} at 100%")
+        
+        # Show debug info for some 100% stems to understand why
+        print(f"\n🔍 Debug Info for 100% Stems (to understand threshold calculation):")
+        hundred_percent_count = 0
+        for track_name, track_results_dict in track_results.items():
+            for source, source_result in track_results_dict.items():
+                if source_result['status'] == 'ok' and source_result['percentage'] >= 99.9:
+                    if hundred_percent_count < 3:  # Show first 3 examples
+                        debug = source_result['debug']
+                        print(f"   {track_name}/{source}: {source_result['percentage']:.1f}%")
+                        print(f"     Overall RMS: {debug['overall_rms']:.6f}")
+                        print(f"     Peak RMS: {debug['peak_rms']:.6f}")
+                        print(f"     Adaptive threshold: {debug['adaptive_threshold']:.6f}")
+                        print(f"     Non-silent chunks: {debug['non_silent_chunks']}/{debug['total_chunks']}")
+                        print(f"     Chunk RMS mean: {debug['chunk_rms_mean']:.6f}")
+                        print(f"     Chunk RMS max: {debug['chunk_rms_max']:.6f}")
+                        hundred_percent_count += 1
+                    else:
+                        break
+            if hundred_percent_count >= 3:
+                break
+        
+        plt.show()
+    
+    # Save detailed results to JSON
+    results_file = output_dir / "audio_content_results.json"
+    with open(results_file, 'w') as f:
+        json.dump(track_results, f, indent=2, sort_keys=True)
+    
+    print(f"💾 Detailed results saved to: {results_file}")
+    
+    return stems_below_threshold == 0
+
+
 def main():
     parser = argparse.ArgumentParser(description="Diagnose automix failures and validate datasets")
     parser.add_argument("command", choices=[
         'dataset', 'analysis', 'suggestions', 'matrix', 
-        'validate', 'quick-validate', 'find-problems', 'missing', 'samples', 'repair'
+        'validate', 'quick-validate', 'find-problems', 'missing', 'samples', 'repair', 'tempo-pitch', 'audio-content'
     ], help="What to analyze")
-    parser.add_argument("--dataset-path", default='/Volumes/SAMPLES/datasets/stem_separation_50_songs_source',
+    parser.add_argument("--dataset-path", default='/Volumes/SAMPLES/datasets/musdb18hq/train',
                        help="Path to dataset")
     parser.add_argument("--strategy", choices=['auto_majority', 'trim_to_shortest', 'pad_to_longest', 'trim_to_majority'], 
                        default='auto_majority', help="Repair strategy for sample count mismatches")
     parser.add_argument("--no-backup", action='store_true', help="Don't backup original files")
     parser.add_argument("--dry-run", action='store_true', help="Show what would be done without making changes")
+    parser.add_argument("--threshold", type=float, default=30.0, help="Threshold percentage for significant audio content (default: 30.0)")
+    parser.add_argument("--sensitivity", type=float, default=0.01, help="Sensitivity for detecting significant audio (0.01 = 1% of peak RMS, default: 0.01)")
     
     args = parser.parse_args()
     
@@ -1108,6 +1908,10 @@ def main():
     elif args.command == 'repair':
         repair_sample_counts(args.dataset_path, strategy=args.strategy, 
                            backup=not args.no_backup, dry_run=args.dry_run)
+    elif args.command == 'tempo-pitch':
+        check_tempo_pitch_compatibility(args.dataset_path)
+    elif args.command == 'audio-content':
+        check_audio_content_percentages(args.dataset_path, threshold=args.threshold, sensitivity=args.sensitivity)
 
 
 if __name__ == '__main__':
