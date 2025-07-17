@@ -1342,13 +1342,13 @@ def check_sample_counts(dataset_path, sources=None):
     return inconsistent_tracks == 0
 
 
-def repair_sample_counts(dataset_path, sources=None, strategy='auto_majority', backup=True, dry_run=False):
+def repair_sample_counts(dataset_path, sources=None, strategy='pad_to_longest', backup=True, dry_run=False):
     """Repair sample count mismatches in tracks by trimming or padding stems.
     
     Args:
         dataset_path: Path to dataset
         sources: List of source names to check
-        strategy: 'auto_majority' (default), 'trim_to_shortest', 'pad_to_longest', or 'trim_to_majority'
+        strategy: 'auto_majority', 'trim_to_shortest', 'pad_to_longest', or 'trim_to_majority'
         backup: Whether to backup original files
         dry_run: If True, only show what would be done without making changes
     """
