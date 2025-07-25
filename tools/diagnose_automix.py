@@ -16,6 +16,8 @@ import traceback
 import tqdm
 import shutil
 import json
+import scipy.stats
+from scipy import signal
 
 # Add librosa imports for tempo/pitch analysis
 try:
@@ -62,6 +64,223 @@ def best_pitch_shift(kr_a, kr_b):
     if ps > 6:
         ps = ps - 12
     return ps
+
+
+def spectral_flatness(waveform, sr=44100, hop_length=512, n_fft=2048):
+    """Calculate spectral flatness (Wiener entropy) to detect noise-like signals."""
+    # Convert to numpy for FFT operations
+    if isinstance(waveform, torch.Tensor):
+        waveform = waveform.numpy()
+    
+    # Compute STFT
+    stft = np.abs(signal.stft(waveform, fs=sr, nperseg=n_fft, noverlap=n_fft-hop_length)[2])
+    
+    # Avoid division by zero
+    stft = np.maximum(stft, 1e-10)
+    
+    # Calculate spectral flatness for each frame
+    geometric_mean = np.exp(np.mean(np.log(stft), axis=0))
+    arithmetic_mean = np.mean(stft, axis=0)
+    
+    flatness = geometric_mean / (arithmetic_mean + 1e-10)
+    
+    return np.mean(flatness)  # Average across all frames
+
+
+def detect_noise_type(waveform, sr=44100, confidence_threshold=0.8):
+    """Detect if audio contains noise and classify the type."""
+    if isinstance(waveform, torch.Tensor):
+        waveform_np = waveform.numpy()
+    else:
+        waveform_np = waveform
+    
+    # Handle stereo by taking mean across channels
+    if len(waveform_np.shape) > 1:
+        waveform_np = np.mean(waveform_np, axis=0)
+    
+    # Skip if too short
+    if len(waveform_np) < sr // 10:  # Less than 0.1 seconds
+        return {"is_noise": False, "confidence": 0.0, "type": "too_short"}
+    
+    # Calculate various noise indicators
+    noise_indicators = {}
+    
+    # 1. Spectral flatness (0-1, higher = more noise-like)
+    flatness = spectral_flatness(waveform_np, sr)
+    noise_indicators['spectral_flatness'] = flatness
+    
+    # 2. Statistical properties
+    # Check if amplitude distribution is approximately Gaussian (noise-like)
+    try:
+        _, p_value = scipy.stats.normaltest(waveform_np)
+        noise_indicators['gaussian_p_value'] = p_value
+    except Exception:
+        noise_indicators['gaussian_p_value'] = 0.0
+    
+    # 3. Autocorrelation analysis (noise should have low autocorrelation)
+    autocorr = np.correlate(waveform_np, waveform_np, mode='full')
+    autocorr = autocorr[len(autocorr)//2:]
+    autocorr = autocorr / autocorr[0]  # Normalize
+    
+    # Check autocorrelation at lag 1 (should be low for white noise)
+    autocorr_lag1 = abs(autocorr[1]) if len(autocorr) > 1 else 1.0
+    noise_indicators['autocorr_lag1'] = autocorr_lag1
+    
+    # 4. Frequency domain analysis
+    fft = np.fft.rfft(waveform_np)
+    power_spectrum = np.abs(fft) ** 2
+    freqs = np.fft.rfftfreq(len(waveform_np), 1/sr)
+    
+    # Skip DC component
+    power_spectrum = power_spectrum[1:]
+    freqs = freqs[1:]
+    
+    if len(power_spectrum) > 10:  # Need enough frequency bins
+        # Log-log slope analysis for noise type classification
+        log_freqs = np.log10(freqs + 1e-10)
+        log_power = np.log10(power_spectrum + 1e-10)
+        
+        # Fit line to log-log plot
+        try:
+            slope, intercept, r_value, _, _ = scipy.stats.linregress(log_freqs, log_power)
+            noise_indicators['spectral_slope'] = slope
+            noise_indicators['spectral_slope_r2'] = r_value ** 2
+        except Exception:
+            noise_indicators['spectral_slope'] = 0.0
+            noise_indicators['spectral_slope_r2'] = 0.0
+        
+        # Spectral centroid variability (should be low for noise)
+        # Calculate spectral centroid in frames
+        frame_size = sr // 20  # 50ms frames
+        centroids = []
+        for i in range(0, len(waveform_np) - frame_size, frame_size // 2):
+            frame = waveform_np[i:i + frame_size]
+            frame_fft = np.fft.rfft(frame)
+            frame_power = np.abs(frame_fft) ** 2
+            frame_freqs = np.fft.rfftfreq(len(frame), 1/sr)
+            
+            # Calculate weighted centroid
+            if np.sum(frame_power) > 0:
+                centroid = np.sum(frame_freqs * frame_power) / np.sum(frame_power)
+                centroids.append(centroid)
+        
+        if len(centroids) > 1:
+            centroid_std = np.std(centroids)
+            centroid_mean = np.mean(centroids)
+            noise_indicators['centroid_variability'] = centroid_std / (centroid_mean + 1e-10)
+        else:
+            noise_indicators['centroid_variability'] = 0.0
+    else:
+        noise_indicators['spectral_slope'] = 0.0
+        noise_indicators['spectral_slope_r2'] = 0.0
+        noise_indicators['centroid_variability'] = 0.0
+    
+    # 5. Zero crossing rate analysis
+    zero_crossings = np.where(np.diff(np.sign(waveform_np)))[0]
+    zcr = len(zero_crossings) / len(waveform_np) * sr
+    noise_indicators['zero_crossing_rate'] = zcr
+    
+    # Classification logic
+    is_noise = False
+    confidence = 0.0
+    noise_type = "musical"
+    
+    # Thresholds for noise detection (empirically determined)
+    flatness_threshold = 0.8  # Higher = more noise-like
+    autocorr_threshold = 0.1  # Lower = more noise-like
+    gaussian_threshold = 0.05  # Higher p-value = more Gaussian/noise-like
+    
+    # Count noise indicators
+    noise_score = 0
+    max_score = 4
+    
+    if flatness > flatness_threshold:
+        noise_score += 1
+    if autocorr_lag1 < autocorr_threshold:
+        noise_score += 1
+    if noise_indicators['gaussian_p_value'] > gaussian_threshold:
+        noise_score += 1
+    if noise_indicators['centroid_variability'] < 0.5:  # Low variability suggests noise
+        noise_score += 1
+    
+    confidence = noise_score / max_score
+    
+    if confidence >= confidence_threshold:  # Use configurable threshold
+        is_noise = True
+        
+        # Classify noise type based on spectral slope
+        slope = noise_indicators['spectral_slope']
+        slope_r2 = noise_indicators['spectral_slope_r2']
+        
+        if slope_r2 > 0.7:  # Good linear fit in log-log domain
+            if -0.5 <= slope <= 0.5:
+                noise_type = "white_noise"
+            elif -2.0 <= slope < -0.5:
+                noise_type = "pink_noise"
+            elif slope < -2.0:
+                noise_type = "brown_noise"
+            elif slope > 0.5:
+                noise_type = "blue_noise"
+            else:
+                noise_type = "colored_noise"
+        else:
+            # Poor linear fit, might be more complex noise
+            if flatness > 0.9:
+                noise_type = "white_noise"  # Very flat spectrum
+            else:
+                noise_type = "colored_noise"
+    
+    return {
+        "is_noise": is_noise,
+        "confidence": confidence,
+        "type": noise_type,
+        "indicators": noise_indicators
+    }
+
+
+def analyze_audio_chunk_content(chunk, sr=44100, rms_threshold=1e-3, confidence_threshold=0.8):
+    """Analyze a chunk of audio to determine if it's silent, noise, or musical content."""
+    # Calculate RMS
+    chunk_rms = torch.sqrt(torch.mean(chunk**2)).item()
+    
+    if chunk_rms < rms_threshold:
+        return {
+            "type": "silent",
+            "rms": chunk_rms,
+            "noise_analysis": None
+        }
+    
+    # Analyze for noise if above threshold
+    noise_result = detect_noise_type(chunk, sr, confidence_threshold)
+    
+    if noise_result["is_noise"]:
+        content_type = f"noise_{noise_result['type']}"
+    else:
+        content_type = "musical"
+    
+    return {
+        "type": content_type,
+        "rms": chunk_rms,
+        "noise_analysis": noise_result
+    }
+
+
+def convert_to_json_serializable(obj):
+    """Convert numpy types and other non-JSON-serializable types to Python native types."""
+    if isinstance(obj, dict):
+        return {key: convert_to_json_serializable(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_to_json_serializable(item) for item in obj]
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, (np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, (np.int32, np.int64)):
+        return int(obj)
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
+    else:
+        return obj
 
 
 def analyse_track_tempo_pitch(track_data, track_name="Unknown"):
@@ -1583,7 +1802,7 @@ def repair_sample_counts(dataset_path, sources=None, strategy='pad_to_longest', 
     return tracks_repaired > 0
 
 
-def check_audio_content_percentages(dataset_path, sources=None, threshold=30, sensitivity=0.01):
+def check_audio_content_percentages(dataset_path, sources=None, threshold=30, sensitivity=0.01, include_noise_analysis=False, confidence_threshold=0.8):
     """Check percentage of significant audio content in each stem."""
     if sources is None:
         sources = SOURCES
@@ -1592,6 +1811,9 @@ def check_audio_content_percentages(dataset_path, sources=None, threshold=30, se
     print(f"Threshold: {threshold}% significant audio")
     print(f"Sensitivity: {sensitivity*100:.1f}% of peak RMS")
     print(f"Window size: 50ms (DC-removed)")
+    print(f"Noise analysis: {'Enabled' if include_noise_analysis else 'Disabled'}")
+    if include_noise_analysis:
+        print(f"Noise confidence threshold: {confidence_threshold*100:.0f}%")
     print(f"Sources: {sources}")
     print(f"=" * 60)
     
@@ -1614,15 +1836,22 @@ def check_audio_content_percentages(dataset_path, sources=None, threshold=30, se
     total_stems_analyzed = 0
     stems_below_threshold = 0
     
+    # Additional noise tracking if enabled
+    noise_chunks_found = 0
+    total_chunks_analyzed = 0
+    noise_type_counts = Counter()
+    
     def analyze_stem_content(stem_file):
         """Analyze audio content percentage in a single stem file."""
+        nonlocal noise_chunks_found, total_chunks_analyzed, noise_type_counts
+        
         try:
             # Load the entire file
             waveform, sr = torchaudio.load(str(stem_file))
             total_samples = waveform.shape[-1]
             
             if total_samples == 0:
-                return 0.0, "Empty file", {}
+                return 0.0, "Empty file", {}, {}
             
             # Remove DC offset first
             waveform_dc_removed = waveform - torch.mean(waveform, dim=-1, keepdim=True)
@@ -1640,15 +1869,34 @@ def check_audio_content_percentages(dataset_path, sources=None, threshold=30, se
             total_chunks = 0
             chunk_rms_values = []
             
+            # Noise analysis tracking
+            noise_analysis_results = {}
+            chunk_noise_types = Counter()
+            noise_chunks_in_stem = 0
+            
             # Process in chunks
             for i in range(0, total_samples, chunk_size):
                 chunk = waveform_dc_removed[..., i:i+chunk_size]
                 if chunk.shape[-1] > 0:  # Valid chunk
                     chunk_rms = torch.sqrt(torch.mean(chunk**2))
                     chunk_rms_values.append(float(chunk_rms))
-                    if chunk_rms > adaptive_threshold:
-                        non_silent_chunks += 1
                     total_chunks += 1
+                    
+                    if include_noise_analysis:
+                        total_chunks_analyzed += 1
+                    
+                    is_significant = chunk_rms > adaptive_threshold
+                    if is_significant:
+                        non_silent_chunks += 1
+                        
+                        # Perform noise analysis on significant chunks if requested
+                        if include_noise_analysis and chunk.shape[-1] >= sr // 10:  # At least 0.1s for noise analysis
+                            noise_result = detect_noise_type(chunk, sr, confidence_threshold)
+                            if noise_result["is_noise"]:
+                                noise_chunks_in_stem += 1
+                                noise_chunks_found += 1
+                                chunk_noise_types[noise_result["type"]] += 1
+                                noise_type_counts[noise_result["type"]] += 1
             
             if total_chunks > 0:
                 percentage = (non_silent_chunks / total_chunks) * 100
@@ -1664,12 +1912,20 @@ def check_audio_content_percentages(dataset_path, sources=None, threshold=30, se
                     'chunk_rms_max': float(np.max(chunk_rms_values)) if chunk_rms_values else 0
                 }
                 
-                return percentage, None, debug_info
+                # Noise analysis results
+                if include_noise_analysis:
+                    noise_analysis_results = {
+                        'noise_chunks': noise_chunks_in_stem,
+                        'noise_percentage': (noise_chunks_in_stem / non_silent_chunks * 100) if non_silent_chunks > 0 else 0,
+                        'noise_types': dict(chunk_noise_types)
+                    }
+                
+                return percentage, None, debug_info, noise_analysis_results
             else:
-                return 0.0, "No valid chunks", {}
+                return 0.0, "No valid chunks", {}, {}
                 
         except Exception as e:
-            return 0.0, f"Error: {str(e)}", {}
+            return 0.0, f"Error: {str(e)}", {}, {}
     
     with tqdm.tqdm(track_dirs, desc="Analyzing audio content", unit="track") as pbar:
         for track_dir in pbar:
@@ -1685,18 +1941,20 @@ def check_audio_content_percentages(dataset_path, sources=None, threshold=30, se
                     track_results[track_dir.name][source] = {
                         'percentage': 0.0,
                         'status': 'missing',
-                        'error': 'File not found'
+                        'error': 'File not found',
+                        'noise_analysis': {} if include_noise_analysis else None
                     }
                     continue
                 
                 total_stems_analyzed += 1
-                percentage, error, debug_info = analyze_stem_content(stem_file)
+                percentage, error, debug_info, noise_analysis_results = analyze_stem_content(stem_file)
                 
                 track_results[track_dir.name][source] = {
                     'percentage': percentage,
                     'status': 'ok' if error is None else 'error',
                     'error': error,
-                    'debug': debug_info
+                    'debug': debug_info,
+                    'noise_analysis': noise_analysis_results if include_noise_analysis else None
                 }
                 
                 # Check if below threshold
@@ -1715,6 +1973,20 @@ def check_audio_content_percentages(dataset_path, sources=None, threshold=30, se
     print(f"Total stems analyzed: {total_stems_analyzed}")
     print(f"Stems below {threshold}% threshold: {stems_below_threshold}")
     print(f"Problem rate: {stems_below_threshold/total_stems_analyzed*100:.1f}%")
+    
+    # Add noise analysis summary if enabled
+    if include_noise_analysis and total_chunks_analyzed > 0:
+        noise_rate = noise_chunks_found / total_chunks_analyzed * 100
+        print(f"\n🎭 Noise Analysis Summary:")
+        print(f"Total chunks analyzed: {total_chunks_analyzed}")
+        print(f"Chunks containing noise: {noise_chunks_found}")
+        print(f"Overall noise rate: {noise_rate:.1f}%")
+        
+        if noise_type_counts:
+            print(f"Noise type distribution:")
+            for noise_type, count in noise_type_counts.most_common():
+                percentage = count / sum(noise_type_counts.values()) * 100
+                print(f"  {noise_type}: {count} chunks ({percentage:.1f}%)")
     
     if problematic_stems:
         print(f"\n🚫 Stems with < {threshold}% significant audio:")
@@ -1735,7 +2007,15 @@ def check_audio_content_percentages(dataset_path, sources=None, threshold=30, se
         for track_name, stems in sorted_tracks:
             print(f"\n📁 {track_name}:")
             for stem in sorted(stems, key=lambda x: x['percentage']):
-                print(f"   {stem['source']}: {stem['percentage']:.1f}% significant audio")
+                noise_info = ""
+                if include_noise_analysis:
+                    stem_result = track_results[track_name][stem['source']]
+                    if stem_result.get('noise_analysis') and stem_result['noise_analysis'].get('noise_chunks', 0) > 0:
+                        noise_pct = stem_result['noise_analysis']['noise_percentage']
+                        main_noise_type = max(stem_result['noise_analysis']['noise_types'].items(), key=lambda x: x[1])[0] if stem_result['noise_analysis']['noise_types'] else 'unknown'
+                        noise_info = f" (🎭 {noise_pct:.1f}% {main_noise_type})"
+                
+                print(f"   {stem['source']}: {stem['percentage']:.1f}% significant audio{noise_info}")
         
     
     else:
@@ -1756,20 +2036,23 @@ def check_audio_content_percentages(dataset_path, sources=None, threshold=30, se
         # Create separate plots for each source type
         available_sources = [source for source in sources if source in source_data]
         
-        # Calculate subplot layout
-        n_sources = len(available_sources)
-        cols = min(3, n_sources)  # Max 3 columns
-        rows = (n_sources + cols - 1) // cols  # Ceiling division
+        # Calculate subplot layout - add extra plot for noise if noise analysis is enabled
+        n_plots = len(available_sources)
+        if include_noise_analysis and noise_type_counts:
+            n_plots += 1
+        
+        cols = min(3, n_plots)  # Max 3 columns
+        rows = (n_plots + cols - 1) // cols  # Ceiling division
         
         fig, axes = plt.subplots(rows, cols, figsize=(5*cols, 4*rows))
         
         # Handle single subplot case
-        if n_sources == 1:
+        if n_plots == 1:
             axes = [axes]
-        elif rows == 1:
-            axes = axes if n_sources > 1 else [axes]
+        elif rows == 1 and cols > 1:
+            axes = axes if n_plots > 1 else [axes]
         else:
-            axes = axes.flatten()
+            axes = axes.flatten() if n_plots > 1 else [axes]
         
         # Create histogram for each source
         for i, source in enumerate(available_sources):
@@ -1815,8 +2098,20 @@ def check_audio_content_percentages(dataset_path, sources=None, threshold=30, se
             ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=8, 
                    verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
         
+        # Add noise type distribution plot if noise analysis was performed
+        if include_noise_analysis and noise_type_counts and len(available_sources) < n_plots:
+            ax = axes[len(available_sources)]
+            
+            types = list(noise_type_counts.keys())
+            counts = list(noise_type_counts.values())
+            colors = plt.cm.Set3(np.linspace(0, 1, len(types)))
+            
+            wedges, texts, autotexts = ax.pie(counts, labels=types, autopct='%1.1f%%', 
+                                             colors=colors, startangle=90)
+            ax.set_title(f"Noise Type Distribution\n(Total: {sum(counts)} chunks)")
+        
         # Hide unused subplots
-        for i in range(n_sources, len(axes)):
+        for i in range(n_plots, len(axes)):
             axes[i].set_visible(False)
         
         plt.tight_layout()
@@ -1825,7 +2120,8 @@ def check_audio_content_percentages(dataset_path, sources=None, threshold=30, se
         output_dir = root / "audio_content_analysis"
         output_dir.mkdir(exist_ok=True)
         
-        plot_file = output_dir / "audio_content_distributions.png"
+        plot_filename = "audio_content_distributions_with_noise.png" if include_noise_analysis else "audio_content_distributions.png"
+        plot_file = output_dir / plot_filename
         plt.savefig(plot_file, dpi=300, bbox_inches='tight')
         print(f"📈 Distribution plots saved to: {plot_file}")
         
@@ -1852,6 +2148,13 @@ def check_audio_content_percentages(dataset_path, sources=None, threshold=30, se
                         print(f"     Non-silent chunks: {debug['non_silent_chunks']}/{debug['total_chunks']}")
                         print(f"     Chunk RMS mean: {debug['chunk_rms_mean']:.6f}")
                         print(f"     Chunk RMS max: {debug['chunk_rms_max']:.6f}")
+                        
+                        if include_noise_analysis and source_result.get('noise_analysis'):
+                            noise_info = source_result['noise_analysis']
+                            print(f"     Noise chunks: {noise_info.get('noise_chunks', 0)} ({noise_info.get('noise_percentage', 0):.1f}%)")
+                            if noise_info.get('noise_types'):
+                                print(f"     Noise types: {noise_info['noise_types']}")
+                        
                         hundred_percent_count += 1
                     else:
                         break
@@ -1863,18 +2166,341 @@ def check_audio_content_percentages(dataset_path, sources=None, threshold=30, se
     # Save detailed results to JSON
     results_file = output_dir / "audio_content_results.json"
     with open(results_file, 'w') as f:
-        json.dump(track_results, f, indent=2, sort_keys=True)
+        json.dump(convert_to_json_serializable(track_results), f, indent=2, sort_keys=True)
     
     print(f"💾 Detailed results saved to: {results_file}")
     
     return stems_below_threshold == 0
 
 
+def analyze_noise_content(dataset_path, sources=None, chunk_duration=1.0, analysis_limit=None, confidence_threshold=0.8):
+    """Analyze dataset for noise content in stems."""
+    if sources is None:
+        sources = SOURCES
+    
+    print(f"🔍 Noise Content Analysis")
+    print(f"Dataset: {dataset_path}")
+    print(f"Chunk duration: {chunk_duration}s")
+    print(f"Analysis limit: {analysis_limit or 'None'}")
+    print(f"Confidence threshold: {confidence_threshold*100:.0f}%")
+    print(f"Sources: {sources}")
+    print(f"=" * 60)
+    
+    root = Path(dataset_path)
+    if not root.exists():
+        print(f"❌ Dataset path does not exist: {dataset_path}")
+        return False
+    
+    # Find all track directories
+    track_dirs = [d for d in root.iterdir() if d.is_dir()]
+    if not track_dirs:
+        print(f"❌ No track directories found")
+        return False
+    
+    # Limit analysis if requested
+    if analysis_limit:
+        track_dirs = track_dirs[:analysis_limit]
+        print(f"📊 Limiting analysis to first {analysis_limit} tracks")
+    
+    print(f"📁 Analyzing noise content in {len(track_dirs)} tracks...")
+    
+    # Results tracking
+    noise_results = {}
+    total_chunks_analyzed = 0
+    noise_chunks_found = 0
+    noise_type_counts = Counter()
+    track_noise_summaries = {}
+    
+    chunk_size = int(SR * chunk_duration)  # samples per chunk
+    
+    with tqdm.tqdm(track_dirs, desc="Analyzing noise content", unit="track") as pbar:
+        for track_dir in pbar:
+            pbar.set_postfix(track=track_dir.name[:20])
+            
+            track_noise_results = {}
+            track_chunk_count = 0
+            track_noise_count = 0
+            track_noise_types = Counter()
+            
+            # Analyze each stem
+            for source in sources:
+                stem_file = track_dir / f"{source}.wav"
+                
+                if not stem_file.exists():
+                    track_noise_results[source] = {
+                        "status": "missing",
+                        "chunks_analyzed": 0,
+                        "noise_chunks": 0,
+                        "noise_types": {},
+                        "error": "File not found"
+                    }
+                    continue
+                
+                try:
+                    # Load audio file
+                    waveform, sr = torchaudio.load(str(stem_file))
+                    
+                    if sr != SR:
+                        waveform = torchaudio.functional.resample(waveform, sr, SR)
+                        sr = SR
+                    
+                    # Remove DC offset
+                    waveform = waveform - torch.mean(waveform, dim=-1, keepdim=True)
+                    
+                    # Analyze in chunks
+                    total_samples = waveform.shape[-1]
+                    source_chunks = 0
+                    source_noise_chunks = 0
+                    source_noise_types = Counter()
+                    chunk_details = []
+                    
+                    # Process chunks with overlap
+                    hop_size = chunk_size // 2  # 50% overlap
+                    
+                    for start_idx in range(0, total_samples - chunk_size, hop_size):
+                        chunk = waveform[..., start_idx:start_idx + chunk_size]
+                        
+                        # Analyze this chunk
+                        chunk_analysis = analyze_audio_chunk_content(chunk, sr, confidence_threshold=confidence_threshold)
+                        source_chunks += 1
+                        track_chunk_count += 1
+                        total_chunks_analyzed += 1
+                        
+                        if chunk_analysis["type"].startswith("noise_"):
+                            source_noise_chunks += 1
+                            track_noise_count += 1
+                            noise_chunks_found += 1
+                            
+                            noise_type = chunk_analysis["noise_analysis"]["type"]
+                            source_noise_types[noise_type] += 1
+                            track_noise_types[noise_type] += 1
+                            noise_type_counts[noise_type] += 1
+                            
+                            # Store details for this chunk
+                            chunk_details.append({
+                                "start_time": start_idx / sr,
+                                "duration": chunk_duration,
+                                "noise_type": noise_type,
+                                "confidence": chunk_analysis["noise_analysis"]["confidence"],
+                                "rms": chunk_analysis["rms"],
+                                "indicators": chunk_analysis["noise_analysis"]["indicators"]
+                            })
+                        
+                        # Limit chunks per stem to avoid excessive processing
+                        if source_chunks >= 100:  # Max 100 chunks per stem
+                            break
+                    
+                    # Calculate percentages for this source
+                    noise_percentage = (source_noise_chunks / source_chunks * 100) if source_chunks > 0 else 0
+                    
+                    track_noise_results[source] = {
+                        "status": "ok",
+                        "chunks_analyzed": source_chunks,
+                        "noise_chunks": source_noise_chunks,
+                        "noise_percentage": noise_percentage,
+                        "noise_types": dict(source_noise_types),
+                        "chunk_details": chunk_details[:10]  # Keep first 10 noise chunks for details
+                    }
+                    
+                except Exception as e:
+                    track_noise_results[source] = {
+                        "status": "error",
+                        "chunks_analyzed": 0,
+                        "noise_chunks": 0,
+                        "noise_types": {},
+                        "error": str(e)
+                    }
+            
+            # Track summary
+            track_noise_percentage = (track_noise_count / track_chunk_count * 100) if track_chunk_count > 0 else 0
+            track_noise_summaries[track_dir.name] = {
+                "total_chunks": track_chunk_count,
+                "noise_chunks": track_noise_count,
+                "noise_percentage": track_noise_percentage,
+                "noise_types": dict(track_noise_types)
+            }
+            
+            noise_results[track_dir.name] = track_noise_results
+    
+    # Generate comprehensive report
+    print(f"\n📊 Noise Analysis Results:")
+    print(f"{'='*60}")
+    print(f"Total tracks analyzed: {len(track_dirs)}")
+    print(f"Total chunks analyzed: {total_chunks_analyzed}")
+    print(f"Chunks containing noise: {noise_chunks_found}")
+    print(f"Overall noise rate: {noise_chunks_found/total_chunks_analyzed*100:.1f}%")
+    
+    # Noise type distribution
+    if noise_type_counts:
+        print(f"\n🎭 Noise Type Distribution:")
+        total_noise_chunks = sum(noise_type_counts.values())
+        for noise_type, count in noise_type_counts.most_common():
+            percentage = count / total_noise_chunks * 100
+            print(f"  {noise_type}: {count} chunks ({percentage:.1f}%)")
+    
+    # Track-level analysis
+    tracks_with_noise = [name for name, summary in track_noise_summaries.items() 
+                        if summary["noise_chunks"] > 0]
+    
+    print(f"\n📁 Track-Level Summary:")
+    print(f"Tracks with noise content: {len(tracks_with_noise)}/{len(track_dirs)} ({len(tracks_with_noise)/len(track_dirs)*100:.1f}%)")
+    
+    if tracks_with_noise:
+        print(f"\n🚫 Tracks with significant noise content (>10%):")
+        print(f"{'Track':<25} {'Noise %':<10} {'Main Types'}")
+        print(f"{'-'*60}")
+        
+        significant_noise_tracks = []
+        for track_name, summary in track_noise_summaries.items():
+            if summary["noise_percentage"] > 10:
+                significant_noise_tracks.append((track_name, summary))
+        
+        # Sort by noise percentage (worst first)
+        significant_noise_tracks.sort(key=lambda x: x[1]["noise_percentage"], reverse=True)
+        
+        for track_name, summary in significant_noise_tracks[:20]:  # Show top 20
+            main_types = ", ".join([f"{ntype}({count})" for ntype, count in 
+                                  Counter(summary["noise_types"]).most_common(3)])
+            print(f"{track_name:<25} {summary['noise_percentage']:<9.1f}% {main_types}")
+        
+        if len(significant_noise_tracks) > 20:
+            print(f"  ... and {len(significant_noise_tracks) - 20} more tracks")
+    
+    # Source-level analysis
+    print(f"\n🎵 Noise by Source Type:")
+    source_noise_stats = {}
+    for source in sources:
+        total_source_chunks = 0
+        noise_source_chunks = 0
+        source_type_counts = Counter()
+        
+        for track_results in noise_results.values():
+            if source in track_results and track_results[source]["status"] == "ok":
+                total_source_chunks += track_results[source]["chunks_analyzed"]
+                noise_source_chunks += track_results[source]["noise_chunks"]
+                for ntype, count in track_results[source]["noise_types"].items():
+                    source_type_counts[ntype] += count
+        
+        if total_source_chunks > 0:
+            noise_rate = noise_source_chunks / total_source_chunks * 100
+            source_noise_stats[source] = {
+                "noise_rate": noise_rate,
+                "total_chunks": total_source_chunks,
+                "noise_chunks": noise_source_chunks,
+                "top_noise_types": source_type_counts.most_common(3)
+            }
+            
+            top_types_str = ", ".join([f"{ntype}({count})" for ntype, count in source_type_counts.most_common(3)])
+            print(f"  {source}: {noise_rate:.1f}% noise ({noise_source_chunks}/{total_source_chunks} chunks) - {top_types_str}")
+    
+    # Save detailed results
+    output_dir = root / "noise_analysis"
+    output_dir.mkdir(exist_ok=True)
+    
+    # Save main results
+    results_file = output_dir / "noise_analysis_results.json"
+    with open(results_file, 'w') as f:
+        json.dump(convert_to_json_serializable(noise_results), f, indent=2, sort_keys=True)
+    
+    # Save summary
+    summary_data = {
+        "analysis_info": {
+            "total_tracks": len(track_dirs),
+            "total_chunks": total_chunks_analyzed,
+            "chunk_duration_seconds": chunk_duration,
+            "analysis_limit": analysis_limit
+        },
+        "overall_stats": {
+            "noise_chunks": noise_chunks_found,
+            "noise_rate_percent": noise_chunks_found/total_chunks_analyzed*100 if total_chunks_analyzed > 0 else 0,
+            "tracks_with_noise": len(tracks_with_noise),
+            "tracks_with_noise_percent": len(tracks_with_noise)/len(track_dirs)*100 if track_dirs else 0
+        },
+        "noise_type_distribution": dict(noise_type_counts),
+        "source_stats": source_noise_stats,
+        "track_summaries": track_noise_summaries
+    }
+    
+    summary_file = output_dir / "noise_analysis_summary.json"
+    with open(summary_file, 'w') as f:
+        json.dump(convert_to_json_serializable(summary_data), f, indent=2)
+    
+    print(f"\n💾 Results saved to:")
+    print(f"  Detailed results: {results_file}")
+    print(f"  Summary: {summary_file}")
+    
+    # Create visualization if matplotlib is available
+    try:
+        # Create noise distribution plot
+        if noise_type_counts:
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+            
+            # Plot 1: Noise type distribution
+            types = list(noise_type_counts.keys())
+            counts = list(noise_type_counts.values())
+            colors = plt.cm.Set3(np.linspace(0, 1, len(types)))
+            
+            wedges, texts, autotexts = ax1.pie(counts, labels=types, autopct='%1.1f%%', 
+                                             colors=colors, startangle=90)
+            ax1.set_title("Noise Type Distribution")
+            
+            # Plot 2: Source noise rates
+            if source_noise_stats:
+                sources_list = list(source_noise_stats.keys())
+                rates = [source_noise_stats[s]["noise_rate"] for s in sources_list]
+                
+                bars = ax2.bar(sources_list, rates, color='lightcoral', alpha=0.7)
+                ax2.set_title("Noise Rate by Source Type")
+                ax2.set_ylabel("Noise Rate (%)")
+                ax2.set_xlabel("Source")
+                ax2.tick_params(axis='x', rotation=45)
+                
+                # Add value labels on bars
+                for bar, rate in zip(bars, rates):
+                    ax2.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.1,
+                           f'{rate:.1f}%', ha='center', va='bottom')
+            
+            plt.tight_layout()
+            
+            plot_file = output_dir / "noise_distribution_plots.png"
+            plt.savefig(plot_file, dpi=300, bbox_inches='tight')
+            print(f"  Plots: {plot_file}")
+            
+            plt.show()
+            
+    except Exception as e:
+        print(f"⚠️  Could not create plots: {e}")
+    
+    # Recommendations
+    print(f"\n💡 Recommendations:")
+    overall_noise_rate = noise_chunks_found/total_chunks_analyzed*100 if total_chunks_analyzed > 0 else 0
+    
+    if overall_noise_rate > 20:
+        print(f"  ❌ High noise content ({overall_noise_rate:.1f}%) detected!")
+        print(f"     This may significantly impact automix quality.")
+        print(f"     Consider noise reduction preprocessing or dataset cleanup.")
+    elif overall_noise_rate > 5:
+        print(f"  ⚠️  Moderate noise content ({overall_noise_rate:.1f}%) detected.")
+        print(f"     Monitor automix results for quality issues.")
+    else:
+        print(f"  ✅ Low noise content ({overall_noise_rate:.1f}%). Dataset appears clean.")
+    
+    # Source-specific recommendations
+    if source_noise_stats:
+        problematic_sources = [s for s, stats in source_noise_stats.items() 
+                             if stats["noise_rate"] > 15]
+        if problematic_sources:
+            print(f"  🎵 Sources with high noise: {', '.join(problematic_sources)}")
+            print(f"     Focus noise reduction efforts on these stem types.")
+    
+    return overall_noise_rate < 10  # Return True if acceptable noise level
+
+
 def main():
     parser = argparse.ArgumentParser(description="Diagnose automix failures and validate datasets")
     parser.add_argument("command", choices=[
         'dataset', 'analysis', 'suggestions', 'matrix', 
-        'validate', 'quick-validate', 'find-problems', 'missing', 'samples', 'repair', 'tempo-pitch', 'audio-content'
+        'validate', 'quick-validate', 'find-problems', 'missing', 'samples', 'repair', 'tempo-pitch', 'audio-content', 'noise'
     ], help="What to analyze")
     parser.add_argument("--dataset-path", default='/Volumes/SAMPLES/datasets/musdb18hq/train',
                        help="Path to dataset")
@@ -1883,7 +2509,11 @@ def main():
     parser.add_argument("--no-backup", action='store_true', help="Don't backup original files")
     parser.add_argument("--dry-run", action='store_true', help="Show what would be done without making changes")
     parser.add_argument("--threshold", type=float, default=30.0, help="Threshold percentage for significant audio content (default: 30.0)")
-    parser.add_argument("--sensitivity", type=float, default=0.01, help="Sensitivity for detecting significant audio (0.01 = 1% of peak RMS, default: 0.01)")
+    parser.add_argument("--sensitivity", type=float, default=0.01, help="Sensitivity for detecting significant audio (0.01 = 1%% of peak RMS, default: 0.01)")
+    parser.add_argument("--chunk-duration", type=float, default=1.0, help="Duration of audio chunks for noise analysis in seconds (default: 1.0)")
+    parser.add_argument("--analysis-limit", type=int, help="Limit noise analysis to first N tracks (for faster testing)")
+    parser.add_argument("--include-noise", action='store_true', help="Include noise analysis in audio-content command")
+    parser.add_argument("--confidence-threshold", type=float, default=0.8, help="Confidence threshold for noise detection (0.0-1.0, default: 0.8)")
     
     args = parser.parse_args()
     
@@ -1911,7 +2541,9 @@ def main():
     elif args.command == 'tempo-pitch':
         check_tempo_pitch_compatibility(args.dataset_path)
     elif args.command == 'audio-content':
-        check_audio_content_percentages(args.dataset_path, threshold=args.threshold, sensitivity=args.sensitivity)
+        check_audio_content_percentages(args.dataset_path, threshold=args.threshold, sensitivity=args.sensitivity, include_noise_analysis=args.include_noise, confidence_threshold=args.confidence_threshold)
+    elif args.command == 'noise':
+        analyze_noise_content(args.dataset_path, chunk_duration=args.chunk_duration, analysis_limit=args.analysis_limit, confidence_threshold=args.confidence_threshold)
 
 
 if __name__ == '__main__':
