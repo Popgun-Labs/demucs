@@ -11,6 +11,12 @@ shift to maximize pitches overlap.
 In order to limit artifacts, only parts that can be mixed with less than 15%
 tempo shift, and 3 semitones of pitch shift are mixed together.
 """
+import os
+os.environ['TMPDIR'] = '/home/ec2-user/data/tmp'
+os.environ['TMP'] = '/home/ec2-user/data/tmp'
+os.environ['TEMP'] = '/home/ec2-user/data/tmp'
+os.environ['PYTORCH_TMPDIR'] = '/home/ec2-user/data/tmp'
+
 from collections import namedtuple
 from concurrent.futures import ProcessPoolExecutor
 import hashlib
@@ -19,6 +25,7 @@ import random
 import shutil
 import tqdm
 import pickle
+import gc  # For garbage collection
 
 from librosa.beat import beat_track
 from librosa.feature import chroma_cqt
@@ -33,11 +40,11 @@ from demucs.pretrained import SOURCES
 from demucs.wav import build_metadata, Wavset, _get_musdb_valid
 
 
-MUSDB_PATH = '/Volumes/SAMPLES/datasets/musdb18hq'
-EXTRA_WAV_PATH = '/Volumes/SAMPLES/datasets/stem_separation_50_songs_source'
+MUSDB_PATH = '/home/ec2-user/data/datasets/musdb18hq'
+EXTRA_WAV_PATH = '/home/ec2-user/data/datasets/stem_separation_50_songs_v3b_train'
 # WARNING: OUTPATH will be completely erased.
-OUTPATH = Path.home() / '/Volumes/SAMPLES/datasets/stem_separation_50_songs_automix'
-CACHE = Path.home() / '/Volumes/SAMPLES/datasets/tmp/automix_cache'  # cache BPM and pitch information.
+OUTPATH = Path.home() / '/home/ec2-user/data/datasets/stem_separation_50_songs_v3b_train_automix'
+CACHE = Path.home() / '/home/ec2-user/data/datasets/tmp/automix_cache'  # cache BPM and pitch information.
 CHANNELS = 2
 SR = 44100
 MAX_PITCH = 3  # maximum allowable pitch shift in semi tones
@@ -148,6 +155,9 @@ def analyse_track(dset, index):
 
     pickle.dump([tempo, events, kr_bass, kr_chordal, kr_lead], open(cache_file, 'wb'))
     spec = Spec(tempo, events, kr_bass, kr_chordal, kr_lead, track, index)
+    
+    # Force garbage collection to free memory
+    gc.collect()
     return spec, None
 
 
@@ -365,21 +375,20 @@ def main():
     copies = 6
     copies_rej = 2
 
-    with ProcessPoolExecutor(20) as pool:
-        for index in range(len(dset)):
-            pendings.append(pool.submit(analyse_track, dset, index))
-
-        if dset2:
-            for index in range(len(dset2)):
-                pendings.append(pool.submit(analyse_track, dset2, index))
-        if dset3:
-            for index in range(len(dset3)):
-                pendings.append(pool.submit(analyse_track, dset3, index))
-
-        catalog = []
-        rej = 0
-        for pending in tqdm.tqdm(pendings, ncols=120):
-            spec, track = pending.result()
+    # Process sequentially (no multiprocessing to avoid tensor serialization issues)
+    catalog = []
+    rej = 0
+    
+    # Process all tracks sequentially
+    print(f"Processing {len(dset)} tracks from main dataset...")
+    
+    # Print initial memory usage
+    import psutil
+    process = psutil.Process()
+    print(f"Initial memory usage: {process.memory_info().rss / 1024 / 1024:.1f} MB")
+    for index in tqdm.tqdm(range(len(dset)), ncols=120, desc="Main dataset"):
+        try:
+            spec, track = analyse_track(dset, index)
             if spec is not None:
                 catalog.append(spec)
             else:
@@ -391,6 +400,23 @@ def main():
                     for stem, source in zip(track, SOURCES):
                         save_audio(stem, folder / f"{source}.wav", SR, clip='clamp')
                     rej += 1
+        except Exception as e:
+            print(f"Error processing track {index}: {e}")
+            import traceback
+            traceback.print_exc()
+            print("Continuing with next track...")
+            continue
+        finally:
+            # Force garbage collection after each track
+            gc.collect()
+            # Print memory usage every 10 tracks
+            if index % 10 == 0:
+                print(f"Memory after {index} tracks: {process.memory_info().rss / 1024 / 1024:.1f} MB")
+
+    print(f"\nTrack analysis complete:")
+    print(f"  - Successful tracks: {len(catalog)}")
+    print(f"  - Rejected tracks: {rej}")
+    print(f"  - Final memory usage: {process.memory_info().rss / 1024 / 1024:.1f} MB")
 
     for copy in range(copies):
         for index in range(len(catalog)):
